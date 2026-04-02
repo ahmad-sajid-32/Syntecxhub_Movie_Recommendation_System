@@ -4,8 +4,12 @@ File: src/recommender/recommend.py
 Purpose:
 - Load saved recommendation artifacts.
 - Find movies by exact or partial title.
-- Return top-N similar movies using cosine similarity.
+- Return top-N similar movies using on-demand TF-IDF scoring.
 - Keep the recommendation interface simple and predictable.
+
+Important design change:
+- This file no longer depends on similarity_matrix.npy.
+- Recommendations are scored on demand from the sparse TF-IDF matrix.
 """
 
 from __future__ import annotations
@@ -18,8 +22,8 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-from scipy.sparse import load_npz
-from sklearn.feature_extraction.text import TfidfVectorizer
+from scipy.sparse import csr_matrix, load_npz
+from sklearn.metrics.pairwise import linear_kernel
 
 from src.features.build_features import FeatureArtifacts, load_processed_movies
 
@@ -51,12 +55,13 @@ class RecommenderAssets:
     """
     Holds everything needed to generate recommendations.
 
-    This object is the runtime package for the recommender.
+    Important design change:
+    - tfidf_matrix is now the primary runtime artifact
+    - full dense similarity_matrix is no longer required
     """
 
     movies_df: pd.DataFrame
-    similarity_matrix: np.ndarray
-    vectorizer: TfidfVectorizer
+    tfidf_matrix: csr_matrix
     movie_id_to_index: dict[int, int]
     index_to_movie_id: dict[int, int]
 
@@ -66,25 +71,23 @@ def validate_recommender_assets(assets: RecommenderAssets) -> None:
     Validate that the recommender assets are internally consistent.
 
     Why this matters:
-    If the matrix row count does not match the movie table row count,
+    If the TF-IDF matrix row count does not match the movie table row count,
     every recommendation becomes wrong.
     """
     movies_count = len(assets.movies_df)
-    similarity_shape = assets.similarity_matrix.shape
+    tfidf_shape = assets.tfidf_matrix.shape
 
     if movies_count == 0:
         raise ValueError("movies_df is empty. Cannot generate recommendations.")
 
-    if similarity_shape[0] != similarity_shape[1]:
+    if tfidf_shape[0] != movies_count:
         raise ValueError(
-            f"Similarity matrix must be square. Received shape={similarity_shape}."
+            "Mismatch between movies_df row count and TF-IDF matrix size. "
+            f"movies_df rows={movies_count}, tfidf_matrix shape={tfidf_shape}."
         )
 
-    if similarity_shape[0] != movies_count:
-        raise ValueError(
-            "Mismatch between movies_df row count and similarity matrix size. "
-            f"movies_df rows={movies_count}, similarity_matrix shape={similarity_shape}."
-        )
+    if tfidf_shape[1] == 0:
+        raise ValueError("TF-IDF matrix has zero columns. Cannot score recommendations.")
 
     if len(assets.movie_id_to_index) != movies_count:
         raise ValueError(
@@ -99,9 +102,9 @@ def validate_recommender_assets(assets: RecommenderAssets) -> None:
         )
 
     logger.info(
-        "Recommender assets validation passed. movies=%d similarity_shape=%s",
+        "Recommender assets validation passed. movies=%d tfidf_shape=%s",
         movies_count,
-        similarity_shape,
+        tfidf_shape,
     )
 
 
@@ -118,37 +121,51 @@ def load_pickle_file(file_path: str | Path) -> Any:
         return pickle.load(file)
 
 
+def load_tfidf_matrix(file_path: str | Path) -> csr_matrix:
+    """
+    Load the saved sparse TF-IDF matrix.
+
+    Row slicing is part of runtime scoring, so CSR format is preferred.
+    """
+    path = Path(file_path).resolve()
+
+    if not path.exists():
+        raise FileNotFoundError(f"Required TF-IDF matrix file not found: {path}")
+
+    tfidf_matrix = load_npz(path)
+
+    if not isinstance(tfidf_matrix, csr_matrix):
+        logger.info("Converting loaded TF-IDF matrix to CSR format.")
+        tfidf_matrix = tfidf_matrix.tocsr()
+
+    return tfidf_matrix
+
+
 def load_recommender_assets(
     processed_movies_path: str | Path = "data/processed/movies_metadata.csv",
     artifact_dir: str | Path = "artifacts",
 ) -> RecommenderAssets:
     """
-    Load all saved assets required for recommendation.
+    Load the saved assets required for recommendation.
 
     Expected files inside artifact_dir:
-    - tfidf_vectorizer.pkl
     - tfidf_matrix.npz
-    - similarity_matrix.npy
     - movie_index_maps.pkl
 
-    Important:
-    tfidf_matrix is loaded mainly for artifact completeness verification.
-    It is not needed directly for simple similarity lookup in this file.
+    Notes:
+    - similarity_matrix.npy is no longer required
+    - tfidf_vectorizer.pkl is not required for title-to-title runtime lookup
     """
     artifact_base = Path(artifact_dir).resolve()
     logger.info("Loading recommender assets from artifact directory: %s", artifact_base)
 
     movies_df = load_processed_movies(file_path=processed_movies_path)
-
-    vectorizer = load_pickle_file(artifact_base / "tfidf_vectorizer.pkl")
-    _ = load_npz(artifact_base / "tfidf_matrix.npz")
-    similarity_matrix = np.load(artifact_base / "similarity_matrix.npy")
+    tfidf_matrix = load_tfidf_matrix(artifact_base / "tfidf_matrix.npz")
     index_maps = load_pickle_file(artifact_base / "movie_index_maps.pkl")
 
     assets = RecommenderAssets(
         movies_df=movies_df,
-        similarity_matrix=similarity_matrix,
-        vectorizer=vectorizer,
+        tfidf_matrix=tfidf_matrix,
         movie_id_to_index=index_maps["movie_id_to_index"],
         index_to_movie_id=index_maps["index_to_movie_id"],
     )
@@ -158,11 +175,39 @@ def load_recommender_assets(
     return assets
 
 
+def load_movies_for_title_search(
+    processed_movies_path: str | Path = "data/processed/movies_metadata.csv",
+) -> pd.DataFrame:
+    """
+    Load only processed movie metadata.
+
+    This is the lightweight path for candidate title lookup.
+    It does not load TF-IDF artifacts.
+    """
+    return load_processed_movies(file_path=processed_movies_path)
+
+
 def normalize_title_for_search(title: str) -> str:
     """
     Normalize a title string for safer matching.
     """
     return " ".join(str(title).strip().lower().split())
+
+
+def prepare_title_search_frame(movies_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Create normalized title columns used by exact and partial matching.
+    """
+    working_df = movies_df.copy()
+
+    working_df["clean_title_norm"] = (
+        working_df["clean_title"].fillna("").astype("string").str.lower().str.strip()
+    )
+    working_df["title_norm"] = (
+        working_df["title"].fillna("").astype("string").str.lower().str.strip()
+    )
+
+    return working_df
 
 
 def find_movies_by_partial_title(
@@ -183,19 +228,14 @@ def find_movies_by_partial_title(
         raise ValueError("Query title cannot be empty.")
 
     normalized_query = normalize_title_for_search(query)
+    working_df = prepare_title_search_frame(movies_df)
 
-    clean_title_series = (
-        movies_df["clean_title"].fillna("").astype("string").str.lower().str.strip()
-    )
-    raw_title_series = (
-        movies_df["title"].fillna("").astype("string").str.lower().str.strip()
-    )
-
-    mask = clean_title_series.str.contains(normalized_query, regex=False) | raw_title_series.str.contains(
-        normalized_query, regex=False
+    mask = (
+        working_df["clean_title_norm"].str.contains(normalized_query, regex=False)
+        | working_df["title_norm"].str.contains(normalized_query, regex=False)
     )
 
-    matches = movies_df.loc[mask].copy()
+    matches = working_df.loc[mask].copy()
 
     if matches.empty:
         logger.warning("No movies found for partial title query: %s", query)
@@ -246,21 +286,12 @@ def resolve_movie_id_from_title(
     - higher rating_count
     - then higher rating_mean
     - then newer release_year
-
-    This is a deliberate tie-break strategy.
     """
     if not title or not title.strip():
         raise ValueError("Title cannot be empty.")
 
     normalized_query = normalize_title_for_search(title)
-    working_df = movies_df.copy()
-
-    working_df["clean_title_norm"] = (
-        working_df["clean_title"].fillna("").astype("string").str.lower().str.strip()
-    )
-    working_df["title_norm"] = (
-        working_df["title"].fillna("").astype("string").str.lower().str.strip()
-    )
+    working_df = prepare_title_search_frame(movies_df)
 
     if prefer_exact:
         exact_matches = working_df[
@@ -285,7 +316,10 @@ def resolve_movie_id_from_title(
                 ascending.append(False)
 
             if sort_columns:
-                exact_matches = exact_matches.sort_values(by=sort_columns, ascending=ascending)
+                exact_matches = exact_matches.sort_values(
+                    by=sort_columns,
+                    ascending=ascending,
+                )
 
             selected_movie_id = int(exact_matches.iloc[0]["movieId"])
             logger.info(
@@ -339,7 +373,10 @@ def to_nullable_float(value: object) -> float | None:
     return float(value)
 
 
-def build_recommendation_result(row: pd.Series, similarity_score: float) -> RecommendationResult:
+def build_recommendation_result(
+    row: pd.Series,
+    similarity_score: float,
+) -> RecommendationResult:
     """
     Convert a movie row into a structured RecommendationResult.
     """
@@ -350,10 +387,29 @@ def build_recommendation_result(row: pd.Series, similarity_score: float) -> Reco
         release_year=to_nullable_int(row.get("release_year")),
         similarity_score=float(similarity_score),
         genres=str(row.get("genres", "")),
-        rating_count=int(row.get("rating_count", 0)) if not pd.isna(row.get("rating_count", 0)) else 0,
+        rating_count=int(row.get("rating_count", 0))
+        if not pd.isna(row.get("rating_count", 0))
+        else 0,
         rating_mean=to_nullable_float(row.get("rating_mean")),
         metadata_text=str(row.get("metadata_text", "")),
     )
+
+
+def compute_similarity_scores(
+    assets: RecommenderAssets,
+    source_index: int,
+) -> np.ndarray:
+    """
+    Compute one-to-all similarity scores for a single movie row.
+
+    Why linear_kernel:
+    TF-IDF vectors are L2-normalized by default, so linear_kernel gives the
+    same ranking behavior as cosine similarity here without requiring a saved
+    dense NxN similarity matrix.
+    """
+    source_vector = assets.tfidf_matrix[source_index]
+    similarity_scores = linear_kernel(source_vector, assets.tfidf_matrix).ravel()
+    return similarity_scores
 
 
 def get_similar_movies_by_movie_id(
@@ -368,7 +424,7 @@ def get_similar_movies_by_movie_id(
 
     Logic:
     - find the movie's row index
-    - read its similarity scores against all movies
+    - compute one-to-all similarity from the TF-IDF matrix
     - sort descending
     - optionally exclude the seed movie itself
     - optionally filter weakly rated movies
@@ -382,8 +438,7 @@ def get_similar_movies_by_movie_id(
         raise ValueError("top_n must be greater than 0.")
 
     source_index = assets.movie_id_to_index[movie_id]
-    similarity_scores = assets.similarity_matrix[source_index]
-
+    similarity_scores = compute_similarity_scores(assets=assets, source_index=source_index)
     ranked_indices = np.argsort(similarity_scores)[::-1]
 
     recommendations: list[RecommendationResult] = []
@@ -441,23 +496,45 @@ def get_similar_movies_by_title(
 
 
 def get_candidate_titles(
-    assets: RecommenderAssets,
+    source: RecommenderAssets | pd.DataFrame,
     query: str,
     limit: int = 10,
 ) -> pd.DataFrame:
     """
     Return possible movie matches for user inspection.
 
-    This is useful when a title is ambiguous.
+    This accepts either:
+    - RecommenderAssets
+    - processed movies DataFrame
+
+    Why:
+    Candidate title lookup should work even when TF-IDF artifacts are not loaded.
     """
-    matches = find_movies_by_partial_title(assets.movies_df, query=query, limit=limit)
+    if isinstance(source, RecommenderAssets):
+        movies_df = source.movies_df
+    elif isinstance(source, pd.DataFrame):
+        movies_df = source
+    else:
+        raise TypeError(
+            "source must be either RecommenderAssets or a pandas DataFrame."
+        )
+
+    matches = find_movies_by_partial_title(movies_df, query=query, limit=limit)
 
     if matches.empty:
         return matches
 
     selected_columns = [
         column
-        for column in ["movieId", "title", "clean_title", "release_year", "genres", "rating_count", "rating_mean"]
+        for column in [
+            "movieId",
+            "title",
+            "clean_title",
+            "release_year",
+            "genres",
+            "rating_count",
+            "rating_mean",
+        ]
         if column in matches.columns
     ]
 
@@ -498,8 +575,7 @@ def build_runtime_assets_from_feature_artifacts(
     """
     assets = RecommenderAssets(
         movies_df=artifacts.movies_df.copy(),
-        similarity_matrix=artifacts.similarity_matrix,
-        vectorizer=artifacts.vectorizer,
+        tfidf_matrix=artifacts.tfidf_matrix,
         movie_id_to_index=artifacts.movie_id_to_index,
         index_to_movie_id=artifacts.index_to_movie_id,
     )

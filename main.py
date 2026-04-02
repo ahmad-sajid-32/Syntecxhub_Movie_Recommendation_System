@@ -11,6 +11,12 @@ Purpose:
 Why this file exists:
 Right now the project has working modules, but no single controlled entry point.
 This file becomes the one place from which the project can actually be operated.
+
+Important design changes:
+- `candidates` now uses only processed movie metadata.
+- `recommend` uses sparse TF-IDF runtime assets.
+- `train` now supports optional dense similarity matrix generation, disabled by default.
+- Flask app import is deferred so non-API commands do not pay unnecessary import cost.
 """
 
 from __future__ import annotations
@@ -28,7 +34,6 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.append(str(PROJECT_ROOT))
 
-from app.app import create_app  # noqa: E402
 from src.models.train_model import (  # noqa: E402
     TrainingConfig,
     print_training_summary,
@@ -37,6 +42,7 @@ from src.models.train_model import (  # noqa: E402
 from src.recommender.recommend import (  # noqa: E402
     get_candidate_titles,
     get_similar_movies_by_title,
+    load_movies_for_title_search,
     load_recommender_assets,
     recommendation_results_to_dataframe,
 )
@@ -112,9 +118,10 @@ def run_train_command(args: argparse.Namespace) -> int:
     Run the full project pipeline:
     1. load raw data
     2. preprocess metadata
-    3. build TF-IDF + similarity artifacts
-    4. save outputs
-    5. print a training summary
+    3. build TF-IDF artifacts
+    4. optionally build dense similarity matrix
+    5. save outputs
+    6. print a training summary
     """
     config = TrainingConfig(
         data_dir=resolve_project_path(args.data_dir),
@@ -125,6 +132,7 @@ def run_train_command(args: argparse.Namespace) -> int:
         sample_titles=parse_sample_titles(args.sample_titles),
         recommendation_top_n=args.recommendation_top_n,
         min_rating_count=args.min_rating_count,
+        build_similarity_matrix=args.build_similarity_matrix,
     )
 
     with timed_block("full_training_pipeline", logger):
@@ -138,18 +146,18 @@ def run_candidates_command(args: argparse.Namespace) -> int:
     """
     Show likely movie matches for a partial title query.
 
-    This is useful when the seed title is ambiguous.
+    Important design change:
+    This is a lightweight path.
+    It loads only processed movie metadata, not TF-IDF artifacts.
     """
     processed_movies_path = resolve_project_path(args.processed_movies_path)
-    artifact_dir = resolve_project_path(args.artifact_dir)
 
     with timed_block("candidate_lookup", logger):
-        assets = load_recommender_assets(
+        movies_df = load_movies_for_title_search(
             processed_movies_path=processed_movies_path,
-            artifact_dir=artifact_dir,
         )
         matches = get_candidate_titles(
-            assets=assets,
+            source=movies_df,
             query=args.query,
             limit=args.limit,
         )
@@ -161,6 +169,9 @@ def run_candidates_command(args: argparse.Namespace) -> int:
 def run_recommend_command(args: argparse.Namespace) -> int:
     """
     Generate top-N recommendations for a movie title.
+
+    This command loads sparse TF-IDF runtime assets and computes
+    one-to-all similarity scores on demand.
     """
     processed_movies_path = resolve_project_path(args.processed_movies_path)
     artifact_dir = resolve_project_path(args.artifact_dir)
@@ -205,7 +216,13 @@ def run_serve_command(args: argparse.Namespace) -> int:
     Important:
     This command serves the API directly from the project.
     It does not use `flask run`.
+
+    Important optimization:
+    Flask app import is deferred so CLI-only commands do not import
+    the API module unnecessarily.
     """
+    from app.app import create_app  # noqa: WPS433,E402
+
     app = create_app()
     app.run(
         host=args.host,
@@ -249,7 +266,7 @@ def build_parser() -> argparse.ArgumentParser:
     train_parser.add_argument(
         "--artifact-dir",
         default="artifacts",
-        help="Directory where vectorizer, matrices, and maps will be saved.",
+        help="Directory where runtime artifacts will be saved.",
     )
     train_parser.add_argument(
         "--summary-output-path",
@@ -278,6 +295,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=10,
         help="Minimum rating count used when generating sample recommendations.",
     )
+    train_parser.add_argument(
+        "--build-similarity-matrix",
+        action="store_true",
+        help=(
+            "Optionally build and save the full dense similarity matrix. "
+            "Disabled by default because sparse TF-IDF + on-demand scoring is the normal runtime path."
+        ),
+    )
     train_parser.set_defaults(func=run_train_command)
 
     candidates_parser = subparsers.add_parser(
@@ -299,11 +324,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--processed-movies-path",
         default="data/processed/movies_metadata.csv",
         help="Path to the processed movie metadata CSV.",
-    )
-    candidates_parser.add_argument(
-        "--artifact-dir",
-        default="artifacts",
-        help="Directory containing saved recommender artifacts.",
     )
     candidates_parser.set_defaults(func=run_candidates_command)
 

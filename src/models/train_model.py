@@ -6,6 +6,10 @@ Purpose:
 - Execute data loading, preprocessing, feature generation, and artifact saving.
 - Produce a training summary that can be used for verification and reporting.
 - Run a few sample recommendation checks to confirm the pipeline works end to end.
+
+Important design change:
+- The dense similarity matrix is now optional.
+- The default runtime strategy is sparse TF-IDF + on-demand scoring.
 """
 
 from __future__ import annotations
@@ -19,15 +23,12 @@ from typing import Any
 import pandas as pd
 
 from src.data.load_data import DatasetBundle, build_dataset_summary, load_movielens_dataset
-from src.data.preprocess import (
-    preprocess_movielens_metadata,
-    save_processed_movies,
-)
+from src.data.preprocess import preprocess_movielens_metadata, save_processed_movies
 from src.features.build_features import (
     FeatureArtifacts,
+    build_feature_artifacts,
     save_feature_artifacts,
 )
-from src.features.build_features import build_feature_artifacts
 from src.recommender.recommend import (
     build_runtime_assets_from_feature_artifacts,
     get_candidate_titles,
@@ -67,6 +68,7 @@ class TrainingConfig:
     )
     recommendation_top_n: int = 5
     min_rating_count: int = 10
+    build_similarity_matrix: bool = False
 
 
 @dataclass(frozen=True)
@@ -84,8 +86,10 @@ class TrainingSummary:
     processed_movies_count: int
     processed_columns: list[str]
     tfidf_matrix_shape: tuple[int, int]
-    similarity_matrix_shape: tuple[int, int]
+    similarity_matrix_built: bool
+    similarity_matrix_shape: tuple[int, int] | None
     vocabulary_size: int
+    saved_artifacts: dict[str, str]
     sample_recommendations: dict[str, list[dict[str, Any]]]
 
 
@@ -98,6 +102,7 @@ class TrainingOutput:
     dataset: DatasetBundle
     processed_movies_df: pd.DataFrame
     feature_artifacts: FeatureArtifacts
+    saved_artifact_paths: dict[str, Path]
     summary: TrainingSummary
 
 
@@ -150,28 +155,42 @@ def run_preprocessing_step(
 def run_feature_build_step(
     processed_movies_df: pd.DataFrame,
     config: TrainingConfig,
-) -> FeatureArtifacts:
+) -> tuple[FeatureArtifacts, dict[str, Path]]:
     """
-    Build TF-IDF and cosine similarity artifacts from the processed movies table.
+    Build TF-IDF artifacts from the processed movies table.
+
+    Important design change:
+    - dense similarity matrix is optional
+    - default runtime path uses sparse TF-IDF only
     """
-    logger.info("Running feature build step.")
+    logger.info(
+        "Running feature build step with build_similarity_matrix=%s.",
+        config.build_similarity_matrix,
+    )
 
     artifacts = build_feature_artifacts(
         movies_df=processed_movies_df,
         text_column=config.text_column,
+        build_similarity_matrix=config.build_similarity_matrix,
     )
-    save_feature_artifacts(
+    saved_artifact_paths = save_feature_artifacts(
         artifacts=artifacts,
         artifact_dir=config.artifact_dir,
     )
 
-    logger.info(
-        "Feature build step completed. tfidf_shape=%s similarity_shape=%s",
-        artifacts.tfidf_matrix.shape,
-        artifacts.similarity_matrix.shape,
-    )
+    if artifacts.similarity_matrix is None:
+        logger.info(
+            "Feature build step completed. tfidf_shape=%s similarity_matrix=not_built",
+            artifacts.tfidf_matrix.shape,
+        )
+    else:
+        logger.info(
+            "Feature build step completed. tfidf_shape=%s similarity_shape=%s",
+            artifacts.tfidf_matrix.shape,
+            artifacts.similarity_matrix.shape,
+        )
 
-    return artifacts
+    return artifacts, saved_artifact_paths
 
 
 def build_sample_recommendations(
@@ -253,6 +272,7 @@ def build_training_summary(
     dataset: DatasetBundle,
     processed_movies_df: pd.DataFrame,
     feature_artifacts: FeatureArtifacts,
+    saved_artifact_paths: dict[str, Path],
     config: TrainingConfig,
 ) -> TrainingSummary:
     """
@@ -269,13 +289,21 @@ def build_training_summary(
         min_rating_count=config.min_rating_count,
     )
 
+    similarity_matrix_built = feature_artifacts.similarity_matrix is not None
+    similarity_matrix_shape: tuple[int, int] | None = None
+
+    if similarity_matrix_built:
+        similarity_matrix_shape = tuple(feature_artifacts.similarity_matrix.shape)
+
     summary = TrainingSummary(
         raw_dataset_summary=raw_dataset_summary,
         processed_movies_count=int(len(processed_movies_df)),
         processed_columns=processed_movies_df.columns.tolist(),
         tfidf_matrix_shape=tuple(feature_artifacts.tfidf_matrix.shape),
-        similarity_matrix_shape=tuple(feature_artifacts.similarity_matrix.shape),
+        similarity_matrix_built=similarity_matrix_built,
+        similarity_matrix_shape=similarity_matrix_shape,
         vocabulary_size=int(len(feature_artifacts.vectorizer.vocabulary_)),
+        saved_artifacts={name: str(path) for name, path in saved_artifact_paths.items()},
         sample_recommendations=sample_recommendations,
     )
 
@@ -311,9 +339,12 @@ def run_training_pipeline(
     Steps:
     1. load raw dataset
     2. preprocess metadata
-    3. build TF-IDF and similarity artifacts
+    3. build TF-IDF artifacts
     4. build summary and sample recommendation checks
     5. save summary
+
+    Important:
+    Dense similarity matrix generation is optional and disabled by default.
     """
     if config is None:
         config = TrainingConfig()
@@ -322,7 +353,7 @@ def run_training_pipeline(
 
     dataset = run_data_loading_step(config=config)
     processed_movies_df = run_preprocessing_step(dataset=dataset, config=config)
-    feature_artifacts = run_feature_build_step(
+    feature_artifacts, saved_artifact_paths = run_feature_build_step(
         processed_movies_df=processed_movies_df,
         config=config,
     )
@@ -330,6 +361,7 @@ def run_training_pipeline(
         dataset=dataset,
         processed_movies_df=processed_movies_df,
         feature_artifacts=feature_artifacts,
+        saved_artifact_paths=saved_artifact_paths,
         config=config,
     )
     save_training_summary(summary=summary, output_path=config.summary_output_path)
@@ -340,6 +372,7 @@ def run_training_pipeline(
         dataset=dataset,
         processed_movies_df=processed_movies_df,
         feature_artifacts=feature_artifacts,
+        saved_artifact_paths=saved_artifact_paths,
         summary=summary,
     )
 
@@ -357,8 +390,17 @@ def print_training_summary(summary: TrainingSummary) -> None:
     print("-" * 80)
     print(f"Processed movies count: {summary.processed_movies_count}")
     print(f"TF-IDF matrix shape: {summary.tfidf_matrix_shape}")
-    print(f"Similarity matrix shape: {summary.similarity_matrix_shape}")
+    print(f"Similarity matrix built: {summary.similarity_matrix_built}")
+    if summary.similarity_matrix_shape is None:
+        print("Similarity matrix shape: not built")
+    else:
+        print(f"Similarity matrix shape: {summary.similarity_matrix_shape}")
     print(f"Vocabulary size: {summary.vocabulary_size}")
+
+    print("-" * 80)
+    print("Saved artifacts:")
+    for name, path in summary.saved_artifacts.items():
+        print(f"{name}: {path}")
 
     print("-" * 80)
     print("Sample recommendations:")
