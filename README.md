@@ -149,8 +149,6 @@ Syntecxhub_Movie_Recommendation_System/
         __init__.py
 ```
 
-````
-
 ---
 
 ## 5. Dataset
@@ -902,4 +900,3 @@ Project Name:
 ```text
 Syntecxhub_Movie_Recommendation_System
 ```
-````
